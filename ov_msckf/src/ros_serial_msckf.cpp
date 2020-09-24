@@ -51,6 +51,7 @@ int main(int argc, char** argv)
     ros::NodeHandle nh("~");
 
     // Create our VIO system
+    //初始化参数 结构体
     VioManagerOptions params = parse_ros_nodehandler(nh);
     sys = new VioManager(params);
     viz = new RosVisualizer(nh, sys);
@@ -143,6 +144,7 @@ int main(int argc, char** argv)
 
 
     // Step through the rosbag
+    //for(auto a:b)中b为一个容器，效果是利用a遍历并获得b容器中的每一个值，但是a无法影响到b容器中的元素。加&代表可以修改b值
     for (const rosbag::MessageInstance& m : view) {
 
         // If ros is wants us to stop, break out

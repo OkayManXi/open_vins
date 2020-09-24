@@ -4,7 +4,7 @@
     <arg name="max_cameras" default="2" />
     <arg name="use_stereo"  default="true" />
     <arg name="bag_start"   default="0" /> <!-- v1-2: 0, mh1: 40, mh2: 35, mh3-5: 20 -->
-    <arg name="bag"         default="/home/patrick/datasets/eth/V1_01_easy.bag" />
+    <arg name="bag"         default="/home/zty/data/EUROC/MH0.bag" />
 
     <!-- imu starting thresholds -->
     <arg name="init_window_time"  default="0.75" />
@@ -117,7 +117,7 @@
 
 
     <!-- play the dataset -->
-    <node pkg="rosbag" type="play" name="rosbag" args="-d 1 -s $(arg bag_start) $(arg bag)" required="true"/>
+   <!-- <node pkg="rosbag" type="play" name="rosbag" args="-d 1 -s $(arg bag_start) $(arg bag)" required="true"/> -->
 
     <!-- record the trajectory if enabled -->
     <group if="$(arg dosave)">

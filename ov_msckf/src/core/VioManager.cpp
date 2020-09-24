@@ -670,14 +670,21 @@ void VioManager::do_feature_propagate_update(double timestamp) {
     }
     timelastupdate = timestamp;
 
+    std::ofstream outfile(("/home/zty/workspace/catkin_ws_ov/src/open_vins/v101easy.txt"),std::ios::app);
+
     // Debug, print our current state
     printf("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n",
             state->_imu->quat()(0),state->_imu->quat()(1),state->_imu->quat()(2),state->_imu->quat()(3),
             state->_imu->pos()(0),state->_imu->pos()(1),state->_imu->pos()(2),distance);
+    //四元数数据
+    outfile <<std::fixed<< std::setprecision(13) << timestamp <<" "<< state->_imu->pos()(0)<<" "<<state->_imu->pos()(1)<<" "<<state->_imu->pos()(2)\
+    <<" "<<state->_imu->quat()(0)<<" "<<-state->_imu->quat()(1)<<" "<<-state->_imu->quat()(2)<<" "<<-state->_imu->quat()(3)<<endl;
+    outfile.close();
+
     printf("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n",
              state->_imu->bias_g()(0),state->_imu->bias_g()(1),state->_imu->bias_g()(2),
              state->_imu->bias_a()(0),state->_imu->bias_a()(1),state->_imu->bias_a()(2));
-
+    
 
     // Debug for camera imu offset
     if(state->_options.do_calib_camera_timeoffset) {
