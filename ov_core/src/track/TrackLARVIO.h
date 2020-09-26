@@ -116,7 +116,7 @@ namespace ov_core {
         // Last set of image pyramids
         std::map<size_t, std::vector<cv::Mat>> img_pyramid_last;
 
-    private:
+    //private:
 
         //IMU state buffer
         std::vector<ImuData> imu_msg_buffer;
@@ -124,7 +124,7 @@ namespace ov_core {
         // Take a vector from prev cam frame to curr cam frame
         cv::Matx33f R_Prev2Curr;  
         cv::Matx33d R_cam_imu;
-        
+
         ImageDataPtr prev_img_ptr;
         ImageDataPtr curr_img_ptr;
 
