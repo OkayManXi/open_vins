@@ -143,6 +143,7 @@ namespace ov_msckf {
         // Tracking flags
         nh.param<bool>("use_stereo", params.use_stereo, params.use_stereo);
         nh.param<bool>("use_klt", params.use_klt, params.use_klt);
+        nh.param<bool>("use_LARVIO", params.use_LARVIO, params.use_LARVIO); //增加的larvios
         nh.param<bool>("use_aruco", params.use_aruco, params.use_aruco);
         nh.param<bool>("downsize_aruco", params.downsize_aruco, params.downsize_aruco);
         nh.param<bool>("downsample_cameras", params.downsample_cameras, params.downsample_cameras);

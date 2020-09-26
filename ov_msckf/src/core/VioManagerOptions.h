@@ -183,6 +183,9 @@ namespace ov_msckf {
         /// If we should use KLT tracking, or descriptor matcher
         bool use_klt = true;
 
+        /// use LARVIO
+        bool use_LARVIO =false;
+
         /// If should extract aruco tags and estimate them
         bool use_aruco = true;
 

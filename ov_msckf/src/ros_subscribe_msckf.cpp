@@ -76,11 +76,11 @@ int main(int argc, char** argv) {
     // Our camera topics (left and right stereo)
     std::string topic_imu;
     std::string topic_camera0, topic_camera1;
-    string txtname;
+    //string txtname;
     nh.param<std::string>("topic_imu", topic_imu, "/imu0");
     nh.param<std::string>("topic_camera0", topic_camera0, "/cam0/image_raw");
     nh.param<std::string>("topic_camera1", topic_camera1, "/cam1/image_raw");
-    nh.param<std::string>("bag", txtname, "/cam1/image_raw");
+    //nh.param<std::string>("bag", txtname, "/cam1/image_raw");
 
     // Logic for sync stereo subscriber
     // https://answers.ros.org/question/96346/subscribe-to-two-image_raws-with-one-function/?answer=96491#post-id-96491

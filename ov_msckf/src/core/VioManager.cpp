@@ -106,6 +106,10 @@ VioManager::VioManager(VioManagerOptions& params_) {
     if(params.use_klt) {
         trackFEATS = new TrackKLT(params.num_pts,state->_options.max_aruco_features,params.fast_threshold,params.grid_x,params.grid_y,params.min_px_dist);
         trackFEATS->set_calibration(params.camera_intrinsics, params.camera_fisheye);
+    } else if (params.use_LARVIO) {
+        //larvio exteding
+        trackFEATS = new TrackLARVIO(params.num_pts,state->_options.max_aruco_features,params.fast_threshold,params.grid_x,params.grid_y,params.min_px_dist);
+        trackFEATS->set_calibration(params.camera_intrinsics, params.camera_fisheye);
     } else {
         trackFEATS = new TrackDescriptor(params.num_pts,state->_options.max_aruco_features,params.fast_threshold,params.grid_x,params.grid_y,params.knn_ratio);
         trackFEATS->set_calibration(params.camera_intrinsics, params.camera_fisheye);
@@ -136,7 +140,7 @@ VioManager::VioManager(VioManagerOptions& params_) {
 
 
 
-
+//imu数据
 void VioManager::feed_measurement_imu(double timestamp, Eigen::Vector3d wm, Eigen::Vector3d am) {
 
     // Push back to our propagator
@@ -152,12 +156,19 @@ void VioManager::feed_measurement_imu(double timestamp, Eigen::Vector3d wm, Eige
         updaterZUPT->feed_imu(timestamp, wm, am);
     }
 
+    //TrackLARVIO
+    if(params.use_LARVIO != nullptr) {
+        trackFEATS->imu_msg_buffer.push_back(ImuData(timestamp,
+            wm(0), wm(1), wm(2), am(0), am(1), am(3)));
+    }
+
+
 }
 
 
 
 
-
+//单目数据和更新
 void VioManager::feed_measurement_monocular(double timestamp, cv::Mat& img0, size_t cam_id) {
 
     // Start timing
@@ -206,7 +217,7 @@ void VioManager::feed_measurement_monocular(double timestamp, cv::Mat& img0, siz
 
 }
 
-
+//双目
 void VioManager::feed_measurement_stereo(double timestamp, cv::Mat& img0, cv::Mat& img1, size_t cam_id0, size_t cam_id1) {
 
     // Start timing
@@ -332,18 +343,21 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
 
 }
 
-
+//初始化
 bool VioManager::try_to_initialize() {
 
     // Returns from our initializer
     double time0;
+    //世界坐标系到i0的旋转四元数
     Eigen::Matrix<double, 4, 1> q_GtoI0;
+    //世界坐标系中的i0速度和位子
     Eigen::Matrix<double, 3, 1> b_w0, v_I0inG, b_a0, p_I0inG;
 
     // Try to initialize the system
     // We will wait for a jerk if we do not have the zero velocity update enabled
     // Otherwise we can initialize right away as the zero velocity will handle the stationary case
     bool wait_for_jerk = (updaterZUPT == nullptr);
+    //imu初始化，得到世界坐标系方向、初始bgba
     bool success = initializer->initialize_with_imu(time0, q_GtoI0, b_w0, v_I0inG, b_a0, p_I0inG, wait_for_jerk);
 
     // Return if it failed
@@ -355,7 +369,7 @@ bool VioManager::try_to_initialize() {
     // Note: start from zero position, as this is what our covariance is based off of
     Eigen::Matrix<double,16,1> imu_val;
     imu_val.block(0,0,4,1) = q_GtoI0;
-    imu_val.block(4,0,3,1) << 0,0,0;
+    imu_val.block(4,0,3,1) << 0,0,0;//p位置xyz
     imu_val.block(7,0,3,1) = v_I0inG;
     imu_val.block(10,0,3,1) = b_w0;
     imu_val.block(13,0,3,1) = b_a0;
@@ -383,7 +397,7 @@ bool VioManager::try_to_initialize() {
 }
 
 
-
+//更新特征、imu数据等
 void VioManager::do_feature_propagate_update(double timestamp) {
 
 
@@ -670,16 +684,17 @@ void VioManager::do_feature_propagate_update(double timestamp) {
     }
     timelastupdate = timestamp;
 
-    std::ofstream outfile(("/home/zty/workspace/catkin_ws_ov/src/open_vins/v101easy.txt"),std::ios::app);
-
     // Debug, print our current state
     printf("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n",
             state->_imu->quat()(0),state->_imu->quat()(1),state->_imu->quat()(2),state->_imu->quat()(3),
             state->_imu->pos()(0),state->_imu->pos()(1),state->_imu->pos()(2),distance);
     //四元数数据
+    /*
+    std::ofstream outfile(("/home/zty/workspace/catkin_ws_ov/src/open_vins/v101easy.txt"),std::ios::app);
     outfile <<std::fixed<< std::setprecision(13) << timestamp <<" "<< state->_imu->pos()(0)<<" "<<state->_imu->pos()(1)<<" "<<state->_imu->pos()(2)\
     <<" "<<state->_imu->quat()(0)<<" "<<-state->_imu->quat()(1)<<" "<<-state->_imu->quat()(2)<<" "<<-state->_imu->quat()(3)<<endl;
     outfile.close();
+    */
 
     printf("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n",
              state->_imu->bias_g()(0),state->_imu->bias_g()(1),state->_imu->bias_g()(2),

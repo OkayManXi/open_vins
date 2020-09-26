@@ -1,27 +1,55 @@
-/*
- * OpenVINS: An Open Platform for Visual-Inertial Research
- * Copyright (C) 2019 Patrick Geneva
- * Copyright (C) 2019 Kevin Eckenhoff
- * Copyright (C) 2019 Guoquan Huang
- * Copyright (C) 2019 OpenVINS Contributors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-#include "TrackKLT.h"
+#include "TrackLARVIO.h"
 
 
 using namespace ov_core;
+
+
+//imu积分
+void TrackLARVIO::integrateImuData(Matx33f& cam_R_p2c,
+        const std::vector<ImuData>& imu_msg_buffer) {
+    // Find the start and the end limit within the imu msg buffer.
+    auto begin_iter = imu_msg_buffer.begin();
+    //begin在上一帧前0.0049s以内
+    while (begin_iter != imu_msg_buffer.end()) {
+    if (begin_iter->timeStampToSec-
+            prev_img_ptr->timeStampToSec < -0.0049)
+        ++begin_iter;
+    else
+        break;
+    }
+
+    auto end_iter = begin_iter;
+    //end在当前帧后0.0049s以内
+    while (end_iter != imu_msg_buffer.end()) {
+    if (end_iter->timeStampToSec-
+            curr_img_ptr->timeStampToSec < 0.0049)
+        ++end_iter;
+    else
+        break;
+    }
+    //计算角速度均值
+    // Compute the mean angular velocity in the IMU frame.
+    Vec3f mean_ang_vel(0.0, 0.0, 0.0);
+    for (auto iter = begin_iter; iter < end_iter; ++iter)
+    mean_ang_vel += Vec3f(iter->angular_velocity[0],
+        iter->angular_velocity[1], iter->angular_velocity[2]);
+
+    if (end_iter-begin_iter > 0)
+    mean_ang_vel *= 1.0f / (end_iter-begin_iter);
+
+    // Transform the mean angular velocity from the IMU
+    // frame to the cam0 and cam1 frames.
+    //imu坐标系转换到相机坐标系
+    Vec3f cam_mean_ang_vel = R_cam_imu.t() * mean_ang_vel;
+
+    // Compute the relative rotation.
+    double dtime = curr_img_ptr->timeStampToSec-
+        prev_img_ptr->timeStampToSec;
+    Rodrigues(cam_mean_ang_vel*dtime, cam_R_p2c);
+    cam_R_p2c = cam_R_p2c.t();
+    //cam_R_p2c是输出的imu计算的相机旋转矩阵
+    return;
+}
 
 
 void TrackKLT::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) {
@@ -597,6 +625,3 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat>& img0pyr, const std::
     }
 
 }
-
-
-

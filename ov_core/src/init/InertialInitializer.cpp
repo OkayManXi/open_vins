@@ -61,9 +61,11 @@ bool InertialInitializer::initialize_with_imu(double &time0, Eigen::Matrix<doubl
     // First lets collect a window of IMU readings from the newest measurement to the oldest
     std::vector<IMUDATA> window_newest, window_secondnew;
     for(IMUDATA data : imu_data) {
+        //newestime-windowtime<datatime<newstime
         if(data.timestamp > newesttime-1*_window_length && data.timestamp <= newesttime-0*_window_length) {
             window_newest.push_back(data);
         }
+        //newesttime-2windostime<datatime<newesttime-windoatime
         if(data.timestamp > newesttime-2*_window_length && data.timestamp <= newesttime-1*_window_length) {
             window_secondnew.push_back(data);
         }
@@ -81,6 +83,7 @@ bool InertialInitializer::initialize_with_imu(double &time0, Eigen::Matrix<doubl
         a_avg += data.am;
     }
     a_avg /= (int)window_newest.size();
+    //加速度方差
     double a_var = 0;
     for(IMUDATA data : window_newest) {
         a_var += (data.am-a_avg).dot(data.am-a_avg);

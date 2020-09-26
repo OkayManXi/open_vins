@@ -31,7 +31,7 @@ void TrackSIM::feed_measurement_simulation(double timestamp, const std::vector<i
 
     // Assert our two vectors are equal
     assert(camids.size()==feats.size());
-
+    //feats为左右相机vector，其中vector由（id，2维坐标点）的pair的vector组成
     // Loop through each camera
     for(size_t i=0; i<camids.size(); i++) {
 
