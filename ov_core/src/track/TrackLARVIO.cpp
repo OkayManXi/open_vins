@@ -3,10 +3,774 @@
 
 using namespace ov_core;
 
+void TrackLARVIO::findNewFeaturesToBeTracked() {
+    const cv::Mat& curr_img = curr_pyramid_[0];
+
+    // Create a mask to avoid redetecting existing features.
+    cv::Mat mask(curr_img.rows,curr_img.cols,CV_8UC1,255);
+    for (const auto& pt : curr_pts_) {
+        // int startRow = round(pt.y) - processor_config.patch_size;
+        //round整数
+        int startRow = std::round(pt.y) - min_px_dist;
+        startRow = (startRow<0) ? 0 : startRow;
+
+        // int endRow = round(pt.y) + processor_config.patch_size;
+        int endRow = std::round(pt.y) + min_px_dist;
+        endRow = (endRow>curr_img.rows-1) ? curr_img.rows-1 : endRow;
+
+        // int startCol = round(pt.x) - processor_config.patch_size;
+        int startCol = std::round(pt.x) - min_px_dist;
+        startCol = (startCol<0) ? 0 : startCol;
+
+        // int endCol = round(pt.x) + processor_config.patch_size;
+        int endCol = std::round(pt.x) + min_px_dist;
+        endCol = (endCol>curr_img.cols-1) ? curr_img.cols-1 : endCol;
+
+        cv::Mat mROI(mask,
+                    cv::Rect(startCol,startRow,endCol-startCol+1,endRow-startRow+1));
+        mROI.setTo(0);
+    }
+
+    // detect new features to be tracked
+    std::vector<cv::Point2f>().swap(new_pts_);
+    if (num_features-curr_pts_.size() > 0)
+        cv::goodFeaturesToTrack(curr_img, new_pts_, 
+            num_features-curr_pts_.size(), 0.01, min_px_dist, mask);
+}
+
+void TrackLARVIO::trackNewFeatures() {
+    // Return if no new features
+    int num_new = new_pts_.size();
+    if ( num_new<=0 ) {
+        // printf("NO NEW FEATURES EXTRACTED IN LAST IMAGE");
+        return;
+    }
+    // else
+    //     printf("%d NEW FEATURES EXTRACTED IN LAST IMAGE",num_new);
+
+    // Pridict features in current image
+    std::vector<cv::Point2f> curr_pts(new_pts_.size());
+    predictFeatureTracking(
+        new_pts_, R_Prev2Curr, cam_intrinsics, curr_pts);
+
+    // Using LK optical flow to track feaures
+    std::vector<unsigned char> track_inliers(new_pts_.size());
+    calcOpticalFlowPyrLK(
+        prev_pyramid_, curr_pyramid_,
+        new_pts_, curr_pts,
+        track_inliers, cv::noArray(),
+        win_size,
+        pyr_levels,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // Mark those tracked points out of the image region
+    // as untracked.
+    for (int i = 0; i < curr_pts.size(); ++i) {   
+        if (track_inliers[i] == 0) continue;
+        if (curr_pts[i].y < 0 ||
+            curr_pts[i].y > curr_img_ptr->image.rows-1 ||
+            curr_pts[i].x < 0 ||
+            curr_pts[i].x > curr_img_ptr->image.cols-1)
+            track_inliers[i] = 0;
+    }  
+
+    // Use inliers to do RANSAC and further remove outliers
+    std::vector<cv::Point2f> prev_pts_inImg_(0);
+    std::vector<cv::Point2f> curr_pts_inImg_(0);
+    removeUnmarkedElements(   
+            new_pts_, track_inliers, prev_pts_inImg_);
+    removeUnmarkedElements(
+            curr_pts, track_inliers, curr_pts_inImg_);
+
+    // Return if no new feature was tracked
+    int num_tracked = prev_pts_inImg_.size();
+    if ( num_tracked<=0 ) {
+        // printf("NO NEW FEATURE IN LAST IMAGE WAS TRACKED");
+        return;
+    }
+
+    // Using reverse LK optical flow tracking to eliminate outliers
+    std::vector<unsigned char> reverse_inliers(curr_pts_inImg_.size());
+    std::vector<cv::Point2f> prev_pts_cpy(prev_pts_inImg_);
+    calcOpticalFlowPyrLK(
+        curr_pyramid_, prev_pyramid_, 
+        curr_pts_inImg_, prev_pts_cpy,
+        reverse_inliers, cv::noArray(),
+        win_size,
+        pyr_levels,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+    // Mark those tracked points out of the image region
+    // as untracked.
+    for (int i = 0; i < prev_pts_cpy.size(); ++i) {  
+        if (reverse_inliers[i] == 0) continue;
+        if (prev_pts_cpy[i].y < 0 ||
+            prev_pts_cpy[i].y > prev_pyramid_[0].rows-1 ||
+            prev_pts_cpy[i].x < 0 ||
+            prev_pts_cpy[i].x > prev_pyramid_[0].cols-1) {
+            reverse_inliers[i] = 0;
+            continue;
+        }
+        float dis = cv::norm(prev_pts_cpy[i]-prev_pts_inImg_[i]);
+        if (dis > 1)    
+            reverse_inliers[i] = 0;
+    }
+    // Remove outliers
+    std::vector<cv::Point2f> prev_pts_inImg(0);
+    std::vector<cv::Point2f> curr_pts_inImg(0);
+    removeUnmarkedElements(    
+            prev_pts_inImg_, reverse_inliers, prev_pts_inImg);
+    removeUnmarkedElements(
+            curr_pts_inImg_, reverse_inliers, curr_pts_inImg);
+    // Return if no new feature was tracked
+    num_tracked = prev_pts_inImg.size();
+    if ( num_tracked<=0 ) {
+        // printf("NO NEW FEATURE IN LAST IMAGE WAS TRACKED");
+        return;
+    }
+
+    // Mark as outliers if descriptor distance is too large
+    std::vector<int> levels(prev_pts_inImg.size(), 0);
+    cv::Mat prevDescriptors, currDescriptors;
+    if (!prevORBDescriptor_ptr->computeDescriptors(prev_pts_inImg, levels, prevDescriptors) ||
+        !currORBDescriptor_ptr->computeDescriptors(curr_pts_inImg, levels, currDescriptors)) {
+        cerr << "error happen while compute descriptors" << endl;
+        return;
+    }
+    std::vector<int> vDis;
+    for (int j = 0; j < prevDescriptors.rows; ++j) {
+        int dis = ORBdescriptor::computeDescriptorDistance(
+                prevDescriptors.row(j), currDescriptors.row(j));
+        vDis.push_back(dis);
+    }
+    std::vector<unsigned char> desc_inliers(prev_pts_inImg.size(), 0);
+    std::vector<cv::Mat> desc_new(0);
+    for (int i = 0; i < prev_pts_inImg.size(); i++) {
+        if (vDis[i]<=58) {  
+            desc_inliers[i] = 1;
+            desc_new.push_back(prevDescriptors.row(i));
+        }
+    }
+
+    // Remove outliers
+    std::vector<cv::Point2f> prev_pts_inlier(0);
+    std::vector<cv::Point2f> curr_pts_inlier(0);
+    removeUnmarkedElements(    
+            prev_pts_inImg, desc_inliers, prev_pts_inlier);
+    removeUnmarkedElements(
+            curr_pts_inImg, desc_inliers, curr_pts_inlier);
+
+    // Return if not enough inliers
+    if ( prev_pts_inlier.size()<20 ){
+        // printf("NO NEW FEATURE IN LAST IMAGE WAS TRACKED");
+        return;
+    }
+
+    // Undistort inliers
+    std::vector<cv::Point2f> prev_unpts_inlier(prev_pts_inlier.size());
+    std::vector<cv::Point2f> curr_unpts_inlier(curr_pts_inlier.size());
+    undistortPoints(
+            prev_pts_inlier, cam_intrinsics,
+            camera_d_OPENCV.at(0), prev_unpts_inlier, 
+            cv::Matx33d::eye(), cam_intrinsics);
+    undistortPoints(
+            curr_pts_inlier, cam_intrinsics,
+            camera_d_OPENCV.at(0), curr_unpts_inlier, 
+            cv::Matx33d::eye(), cam_intrinsics);
+
+    std::vector<unsigned char> ransac_inliers;
+
+    findFundamentalMat(
+            prev_unpts_inlier, curr_unpts_inlier,
+            cv::FM_RANSAC, 1.0, 0.99, ransac_inliers);
+
+    std::vector<cv::Point2f> prev_pts_matched(0);
+    std::vector<cv::Point2f> curr_pts_matched(0);
+    std::vector<cv::Mat> prev_desc_matched(0);
+    removeUnmarkedElements(
+            prev_pts_inlier, ransac_inliers, prev_pts_matched);
+    removeUnmarkedElements(
+            curr_pts_inlier, ransac_inliers, curr_pts_matched);
+    removeUnmarkedElements(
+            desc_new, ransac_inliers, prev_desc_matched);
+
+    // Return if no new feature was tracked
+    int num_ransac = curr_pts_matched.size();
+    if ( num_ransac<=0 ) {
+        // printf("NO NEW FEATURE IN LAST IMAGE WAS TRACKED");
+        return;
+    }
+
+    // Fill initialized features into init_pts_, curr_pts_, 
+    // and set their ids and lifetime
+    for (int i = 0; i < prev_pts_matched.size(); ++i) {
+        prev_pts_.push_back(prev_pts_matched[i]);
+        curr_pts_.push_back(curr_pts_matched[i]);
+        pts_ids_.push_back(next_feature_id++);
+        pts_lifetime_.push_back(2);
+        init_pts_.push_back(prev_pts_matched[i]);
+        vOrbDescriptors.push_back(prev_desc_matched[i]);
+    }
+
+    // Clear new_pts_
+    std::vector<cv::Point2f>().swap(new_pts_);
+}
+
+void TrackLARVIO::trackFeatures() {
+    // Number of the features before tracking.
+    before_tracking = prev_pts_.size();
+
+    // Abort tracking if there is no features in
+    // the previous frame.
+    if (0 == before_tracking) {
+        printf("No feature in prev img !\n");
+        return;
+    }
+
+    // Pridict features in current image
+    std::vector<cv::Point2f> curr_points(prev_pts_.size());
+    //上一帧特征、前后帧相机旋转矩阵、相机内参、当前需要检测的特征的vector
+    //currpoints为上一帧的特征点坐标通过相机旋转矩阵映射到当前帧中
+    predictFeatureTracking(
+        prev_pts_, R_Prev2Curr, cam_intrinsics, curr_points);
+
+    // Using LK optical flow to track feaures（光流法）
+    //trackinliers追踪局内点
+    std::vector<unsigned char> track_inliers(prev_pts_.size());
+    calcOpticalFlowPyrLK(
+        prev_pyramid_, curr_pyramid_,
+        prev_pts_, curr_points,
+        track_inliers, cv::noArray(),
+        win_size,
+        pyr_levels,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // Mark those tracked points out of the image region
+    // as untracked.
+    for (int i = 0; i < curr_points.size(); ++i) {   
+        if (track_inliers[i] == 0) continue;
+        if (curr_points[i].y < 0 ||
+            curr_points[i].y > curr_img_ptr->image.rows-1 ||
+            curr_points[i].x < 0 ||
+            curr_points[i].x > curr_img_ptr->image.cols-1)
+            track_inliers[i] = 0;
+    }  
+
+    // Collect the tracked points.
+    //usign longlong int
+    std::vector<FeatureIDType> prev_inImg_ids_(0);
+    std::vector<int> prev_inImg_lifetime_(0);
+    std::vector<cv::Point2f> prev_inImg_points_(0);
+    std::vector<cv::Point2f> curr_inImg_points_(0);
+    std::vector<cv::Point2f> init_inImg_position_(0);
+    std::vector<cv::Mat> prev_imImg_desc_(0);
+    //原始特征序列、局内点标示、输出特征序列（将光流没有追踪上的抛出序列）（生成了6个序列）
+    removeUnmarkedElements(   
+            pts_ids_, track_inliers, prev_inImg_ids_);
+    removeUnmarkedElements(
+            pts_lifetime_, track_inliers, prev_inImg_lifetime_);
+    removeUnmarkedElements(
+            prev_pts_, track_inliers, prev_inImg_points_);
+    removeUnmarkedElements(
+            curr_points, track_inliers, curr_inImg_points_);
+    removeUnmarkedElements(
+            init_pts_, track_inliers, init_inImg_position_);
+    removeUnmarkedElements(
+            vOrbDescriptors, track_inliers, prev_imImg_desc_);
+
+    // Number of features left after tracking.
+    after_tracking = curr_inImg_points_.size();
+
+    // debug log
+    if (0 == after_tracking) {
+        printf("No feature is tracked !");
+        std::vector<cv::Point2f>().swap(prev_pts_);
+        std::vector<cv::Point2f>().swap(curr_pts_);
+        std::vector<FeatureIDType>().swap(pts_ids_);
+        std::vector<int>().swap(pts_lifetime_);
+        std::vector<cv::Point2f>().swap(init_pts_);
+        std::vector<cv::Mat>().swap(vOrbDescriptors);
+        return;
+    }
+
+    // Using reverse LK optical flow tracking to eliminate outliers
+    std::vector<unsigned char> reverse_inliers(curr_inImg_points_.size());
+    std::vector<cv::Point2f> prev_pts_cpy(prev_inImg_points_);
+    calcOpticalFlowPyrLK(
+        curr_pyramid_, prev_pyramid_, 
+        curr_inImg_points_, prev_pts_cpy,
+        reverse_inliers, cv::noArray(),
+        win_size,
+        pyr_levels,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+    // Mark those tracked points out of the image region
+    // as untracked.
+    for (int i = 0; i < prev_pts_cpy.size(); ++i) {  
+        if (reverse_inliers[i] == 0) continue;
+        if (prev_pts_cpy[i].y < 0 ||
+            prev_pts_cpy[i].y > prev_pyramid_[0].rows-1 ||
+            prev_pts_cpy[i].x < 0 ||
+            prev_pts_cpy[i].x > prev_pyramid_[0].cols-1) {
+            reverse_inliers[i] = 0;
+            continue;
+        }
+        float dis = cv::norm(prev_pts_cpy[i]-prev_inImg_points_[i]);
+        if (dis > 1)    
+            reverse_inliers[i] = 0;
+    }
+    // Remove outliers
+    std::vector<FeatureIDType> prev_inImg_ids(0);
+    std::vector<int> prev_inImg_lifetime(0);
+    std::vector<cv::Point2f> prev_inImg_points(0);
+    std::vector<cv::Point2f> curr_inImg_points(0);
+    std::vector<cv::Point2f> init_inImg_position(0);
+    std::vector<cv::Mat> prev_imImg_desc(0);
+    removeUnmarkedElements(   
+            prev_inImg_ids_, reverse_inliers, prev_inImg_ids);
+    removeUnmarkedElements(
+            prev_inImg_lifetime_, reverse_inliers, prev_inImg_lifetime);
+    removeUnmarkedElements(
+            prev_inImg_points_, reverse_inliers, prev_inImg_points);
+    removeUnmarkedElements(
+            curr_inImg_points_, reverse_inliers, curr_inImg_points);
+    removeUnmarkedElements(
+            init_inImg_position_, reverse_inliers, init_inImg_position);
+    removeUnmarkedElements(
+            prev_imImg_desc_, reverse_inliers, prev_imImg_desc);
+    // Number of features left after tracking.
+    after_tracking = curr_inImg_points.size();
+    // debug log
+    if (0 == after_tracking) {
+        printf("No feature is tracked !");
+        std::vector<cv::Point2f>().swap(prev_pts_);
+        std::vector<cv::Point2f>().swap(curr_pts_);
+        std::vector<FeatureIDType>().swap(pts_ids_);
+        std::vector<int>().swap(pts_lifetime_);
+        std::vector<cv::Point2f>().swap(init_pts_);
+        std::vector<cv::Mat>().swap(vOrbDescriptors);
+        return;
+    }
+
+    // Mark as outliers if descriptor distance is too large
+    std::vector<int> levels(prev_inImg_points.size(), 0);
+    cv::Mat prevDescriptors, currDescriptors;
+    //currdecriptorsptc在processimage中已经确定
+    //描述符存储到currdescriptor中
+    //错误处理
+    if (!currORBDescriptor_ptr->computeDescriptors(curr_inImg_points, levels, currDescriptors)) {
+        cerr << "error happen while compute descriptors" << endl;
+        std::vector<cv::Point2f>().swap(prev_pts_);
+        std::vector<cv::Point2f>().swap(curr_pts_);
+        std::vector<FeatureIDType>().swap(pts_ids_);
+        std::vector<int>().swap(pts_lifetime_);
+        std::vector<cv::Point2f>().swap(init_pts_);
+        std::vector<cv::Mat>().swap(vOrbDescriptors);
+        return;
+    }
+    std::vector<int> vDis;
+    for (int j = 0; j < currDescriptors.rows; ++j) {
+        int dis = ORBdescriptor::computeDescriptorDistance(
+                prev_imImg_desc[j], currDescriptors.row(j));
+        vDis.push_back(dis);
+    }
+    //通过描述符距离判断是否局内点
+    std::vector<unsigned char> desc_inliers(prev_inImg_points.size(), 0);
+    for (int i = 0; i < prev_inImg_points.size(); i++) {
+        if (vDis[i]<=58)  
+            desc_inliers[i] = 1;
+    }
+
+    // Remove outliers
+    std::vector<FeatureIDType> prev_tracked_ids(0);
+    std::vector<int> prev_tracked_lifetime(0);
+    std::vector<cv::Point2f> prev_tracked_points(0);
+    std::vector<cv::Point2f> curr_tracked_points(0);
+    std::vector<cv::Point2f> init_tracked_position(0);
+    std::vector<cv::Mat> prev_tracked_desc(0);
+    removeUnmarkedElements(    
+            prev_inImg_ids, desc_inliers, prev_tracked_ids);
+    removeUnmarkedElements(
+            prev_inImg_lifetime, desc_inliers, prev_tracked_lifetime);
+    removeUnmarkedElements(
+            prev_inImg_points, desc_inliers, prev_tracked_points);
+    removeUnmarkedElements(
+            curr_inImg_points, desc_inliers, curr_tracked_points);
+    removeUnmarkedElements(
+            init_inImg_position, desc_inliers, init_tracked_position);
+    removeUnmarkedElements(
+            prev_imImg_desc, desc_inliers, prev_tracked_desc);
+
+    // Return if not enough inliers
+    //释放内存
+    if ( prev_tracked_points.size()==0 ){
+        printf("No feature is tracked after descriptor matching!\n");
+        std::vector<cv::Point2f>().swap(prev_pts_);
+        std::vector<cv::Point2f>().swap(curr_pts_);
+        std::vector<FeatureIDType>().swap(pts_ids_);
+        std::vector<int>().swap(pts_lifetime_);
+        std::vector<cv::Point2f>().swap(init_pts_);
+        std::vector<cv::Mat>().swap(vOrbDescriptors);
+        return;
+    }
+
+    // Further remove outliers by RANSAC.
+    std::vector<cv::Point2f> prev_tracked_unpts(prev_tracked_points.size());
+    std::vector<cv::Point2f> curr_tracked_unpts(curr_tracked_points.size());
+    undistortPoints(
+            prev_tracked_points, cam_intrinsics,
+            camera_d_OPENCV.at(0), prev_tracked_unpts, 
+            cv::Matx33d::eye(), cam_intrinsics);
+    undistortPoints(
+            curr_tracked_points, cam_intrinsics,
+            camera_d_OPENCV.at(0), curr_tracked_unpts, 
+            cv::Matx33d::eye(), cam_intrinsics);
+
+    std::vector<unsigned char> ransac_inliers;
+
+    findFundamentalMat(
+            prev_tracked_unpts, curr_tracked_unpts,
+            cv::FM_RANSAC, 1.0, 0.99, ransac_inliers);
+
+    // Remove outliers
+    std::vector<FeatureIDType> prev_matched_ids(0);
+    std::vector<int> prev_matched_lifetime(0);
+    std::vector<cv::Point2f> prev_matched_points(0);
+    std::vector<cv::Point2f> curr_matched_points(0);
+    std::vector<cv::Point2f> init_matched_position(0);
+    std::vector<cv::Mat> prev_matched_desc(0);
+    removeUnmarkedElements(
+            prev_tracked_ids, ransac_inliers, prev_matched_ids);
+    removeUnmarkedElements(
+            prev_tracked_lifetime, ransac_inliers, prev_matched_lifetime);
+    removeUnmarkedElements(
+            prev_tracked_points, ransac_inliers, prev_matched_points);
+    removeUnmarkedElements(
+            curr_tracked_points, ransac_inliers, curr_matched_points);
+    removeUnmarkedElements(
+            init_tracked_position, ransac_inliers, init_matched_position);
+    removeUnmarkedElements(
+            prev_tracked_desc, ransac_inliers, prev_matched_desc);
+
+    // Number of matched features left after RANSAC.
+    after_ransac = curr_matched_points.size();
+
+    // debug log
+    if (0 == after_ransac) {
+        printf("No feature survive after RANSAC !");
+        std::vector<cv::Point2f>().swap(prev_pts_);
+        std::vector<cv::Point2f>().swap(curr_pts_);
+        std::vector<FeatureIDType>().swap(pts_ids_);
+        std::vector<int>().swap(pts_lifetime_);
+        std::vector<cv::Point2f>().swap(init_pts_);
+        std::vector<cv::Mat>().swap(vOrbDescriptors);
+        return;
+    }
+
+    // Puts tracked and mateched points into grids
+    std::vector<cv::Point2f>().swap(prev_pts_);
+    std::vector<cv::Point2f>().swap(curr_pts_);
+    std::vector<FeatureIDType>().swap(pts_ids_);
+    std::vector<int>().swap(pts_lifetime_);
+    std::vector<cv::Point2f>().swap(init_pts_);
+    std::vector<cv::Mat>().swap(vOrbDescriptors);
+    for (int i = 0; i < curr_matched_points.size(); ++i) {
+        prev_pts_.push_back(prev_matched_points[i]);    
+        curr_pts_.push_back(curr_matched_points[i]);
+        pts_ids_.push_back(prev_matched_ids[i]);
+        pts_lifetime_.push_back(++prev_matched_lifetime[i]);
+        init_pts_.push_back(init_matched_position[i]);
+        vOrbDescriptors.push_back(prev_matched_desc[i]);
+    }
+
+    return;
+}
+
+bool TrackLARVIO::initializeFirstFeatures(const std::vector<ImuData>& imu_msg_buffer) {
+
+    //通过先前帧和imu推算当前旋转
+    // Integrate gyro data to get a guess of ratation between current and previous image
+    integrateImuData(R_Prev2Curr, imu_msg_buffer);
+
+    // Pridict features in current image
+    std::vector<cv::Point2f> curr_pts(0);
+    predictFeatureTracking(new_pts_, R_Prev2Curr, cam_intrinsics, curr_pts);
+    
+    // Using LK optical flow to track feaures
+    std::vector<unsigned char> track_inliers(new_pts_.size());
+    calcOpticalFlowPyrLK(
+        prev_pyramid_, curr_pyramid_,
+        new_pts_, curr_pts,
+        track_inliers, cv::noArray(),
+        win_size,
+        pyr_levels,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+
+    // Mark those tracked points out of the image region
+    // as untracked.
+    for (int i = 0; i < curr_pts.size(); ++i) {  
+        if (track_inliers[i] == 0) continue;
+        if (curr_pts[i].y < 0 ||
+            curr_pts[i].y > curr_img_ptr->image.rows-1 ||
+            curr_pts[i].x < 0 ||
+            curr_pts[i].x > curr_img_ptr->image.cols-1)
+            track_inliers[i] = 0;
+    }
+
+    // Remove outliers
+    std::vector<cv::Point2f> prev_pts_inImg_(0);
+    std::vector<cv::Point2f> curr_pts_inImg_(0);
+    removeUnmarkedElements(    
+            new_pts_, track_inliers, prev_pts_inImg_);
+    removeUnmarkedElements(
+            curr_pts, track_inliers, curr_pts_inImg_);
+
+    // Return if not enough inliers
+    if ( prev_pts_inImg_.size()<20 )
+        return false;
+
+    // Using reverse LK optical flow tracking to eliminate outliers
+    std::vector<unsigned char> reverse_inliers(curr_pts_inImg_.size());
+    std::vector<cv::Point2f> prev_pts_cpy(prev_pts_inImg_);
+    calcOpticalFlowPyrLK(
+        curr_pyramid_, prev_pyramid_, 
+        curr_pts_inImg_, prev_pts_cpy,
+        reverse_inliers, cv::noArray(),
+        win_size,
+        pyr_levels,
+        cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01),
+        cv::OPTFLOW_USE_INITIAL_FLOW);
+    // Mark those tracked points out of the image region
+    // as untracked.
+    for (int i = 0; i < prev_pts_cpy.size(); ++i) {  
+        if (reverse_inliers[i] == 0) continue;
+        if (prev_pts_cpy[i].y < 0 ||
+            prev_pts_cpy[i].y > prev_pyramid_[0].rows-1 ||
+            prev_pts_cpy[i].x < 0 ||
+            prev_pts_cpy[i].x > prev_pyramid_[0].cols-1) {
+            reverse_inliers[i] = 0;
+            continue;
+        }
+        float dis = cv::norm(prev_pts_cpy[i]-prev_pts_inImg_[i]);
+        if (dis > 1)    
+            reverse_inliers[i] = 0;
+    }
+    // Remove outliers
+    std::vector<cv::Point2f> prev_pts_inImg(0);
+    std::vector<cv::Point2f> curr_pts_inImg(0);
+    removeUnmarkedElements(   
+            prev_pts_inImg_, reverse_inliers, prev_pts_inImg);
+    removeUnmarkedElements(
+            curr_pts_inImg_, reverse_inliers, curr_pts_inImg);
+    // Return if not enough inliers
+    if ( prev_pts_inImg.size()<20 )
+        return false;
+
+    // Mark as outliers if descriptor distance is too large
+    std::vector<int> levels(prev_pts_inImg.size(), 0);
+    cv::Mat prevDescriptors, currDescriptors;
+    if (!prevORBDescriptor_ptr->computeDescriptors(prev_pts_inImg, levels, prevDescriptors) ||
+        !currORBDescriptor_ptr->computeDescriptors(curr_pts_inImg, levels, currDescriptors)) {
+        cerr << "error happen while compute descriptors" << endl;
+        return false;
+    }
+    std::vector<int> vDis;
+    for (int j = 0; j < currDescriptors.rows; ++j) {
+        int dis = ORBdescriptor::computeDescriptorDistance(
+                prevDescriptors.row(j), currDescriptors.row(j));
+        vDis.push_back(dis);
+    }
+    std::vector<unsigned char> desc_inliers(prev_pts_inImg.size(), 0);
+    std::vector<cv::Mat> desc_first(0);
+    for (int i = 0; i < prev_pts_inImg.size(); i++) {
+        if (vDis[i]<=58) {  
+            desc_inliers[i] = 1;
+            desc_first.push_back(prevDescriptors.row(i));
+        }
+    }
+
+    // Remove outliers
+    std::vector<cv::Point2f> prev_pts_inlier(0);
+    std::vector<cv::Point2f> curr_pts_inlier(0);
+    removeUnmarkedElements(   
+            prev_pts_inImg, desc_inliers, prev_pts_inlier);
+    removeUnmarkedElements(
+            curr_pts_inImg, desc_inliers, curr_pts_inlier);
+
+    // Return if not enough inliers
+    if ( prev_pts_inlier.size()<20 )
+        return false;
+
+    // Undistort inliers
+    std::vector<cv::Point2f> prev_unpts_inlier(prev_pts_inlier.size());
+    std::vector<cv::Point2f> curr_unpts_inlier(curr_pts_inlier.size());
+    undistortPoints(
+            prev_pts_inlier, cam_intrinsics,
+            camera_d_OPENCV.at(0), prev_unpts_inlier, 
+            cv::Matx33d::eye(), cam_intrinsics);
+    undistortPoints(
+            curr_pts_inlier, cam_intrinsics,
+            camera_d_OPENCV.at(0), curr_unpts_inlier, 
+            cv::Matx33d::eye(), cam_intrinsics);
+
+    std::vector<unsigned char> ransac_inliers;
+    findFundamentalMat(
+            prev_unpts_inlier, curr_unpts_inlier,
+            cv::FM_RANSAC, 1.0, 0.99, ransac_inliers);
+
+    std::vector<cv::Point2f> prev_pts_matched(0);
+    std::vector<cv::Point2f> curr_pts_matched(0);
+    std::vector<cv::Mat> prev_desc_matched(0);
+    removeUnmarkedElements(
+            prev_pts_inlier, ransac_inliers, prev_pts_matched);
+    removeUnmarkedElements(
+            curr_pts_inlier, ransac_inliers, curr_pts_matched);
+    //ransac局外点
+    removeUnmarkedElements(
+            desc_first, ransac_inliers, prev_desc_matched);
+
+    // Features initialized failed if less than 20 inliers are tracked
+    if ( curr_pts_matched.size()<20 )
+        return false;
+    // and set their ids and lifetime
+    std::vector<cv::Point2f>().swap(prev_pts_);
+    std::vector<cv::Point2f>().swap(curr_pts_);
+    std::vector<FeatureIDType>().swap(pts_ids_);
+    std::vector<int>().swap(pts_lifetime_);
+    std::vector<cv::Point2f>().swap(init_pts_);
+    std::vector<cv::Mat>().swap(vOrbDescriptors);
+    for (int i = 0; i < prev_pts_matched.size(); ++i) {
+        prev_pts_.push_back(prev_pts_matched[i]);
+        init_pts_.push_back(cv::Point2f(-1,-1));       
+        curr_pts_.push_back(curr_pts_matched[i]);
+        pts_ids_.push_back(next_feature_id++);
+        pts_lifetime_.push_back(2);
+        vOrbDescriptors.push_back(prev_desc_matched[i]);
+    }
+
+    // Clear new_pts_
+    std::vector<cv::Point2f>().swap(new_pts_);
+
+    return true;
+}
+
+bool TrackLARVIO::initializeFirstFrame() {
+
+    /*
+    cv::Matx33d cameK=camera_k_OPENCV.at(0);
+    cam_intrinsics(0)=cameK(0,0);
+    cam_intrinsics(1)=cameK(1,1);
+    cam_intrinsics(2)=cameK(0,2);
+    cam_intrinsics(3)=cameK(1,2);
+    */
+
+    // Get current image
+    const cv::Mat& img = img_pyramid_last.at(0)[0];
+
+    // Detect new features on the frist image.
+    std::vector<cv::Point2f>().swap(new_pts_);
+    cv::goodFeaturesToTrack(img, new_pts_, num_features, 0.01, min_px_dist);
+    /*
+    std::vector<cv::KeyPoint> pts0_ext;
+    //Grider_FAST::perform_griding(img, pts0_ext, num_features, grid_x, grid_y, threshold, true);
+    
+    std::vector<cv::KeyPoint> kpts0_new;
+    std::vector<cv::Point2f> pts0_new;
+    for(auto& kpt : pts0_ext) {
+        // See if there is a point at this location
+        if(grid_2d((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1)
+            continue;
+        // Else lets add it!
+        kpts0_new.push_back(kpt);
+        pts0_new.push_back(kpt.pt);
+        grid_2d((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
+    }
+
+    new_pts_.assign(pts0_new.begin(),pts0_new.end());
+    */
+    // Initialize last publish time
+    last_pub_time = curr_img_ptr->timeStampToSec;
+
+    if (new_pts_.size()>20)
+        return true;
+    else
+        return false;
+}
+
+void TrackLARVIO::predictFeatureTracking(
+    const std::vector<cv::Point2f>& input_pts,
+    const cv::Matx33f& R_p_c,
+    const cv::Vec4d& intrinsics,
+    std::vector<cv::Point2f>& compensated_pts) {
+    // Return directly if there are no input features.
+    if (input_pts.size() == 0) {
+        compensated_pts.clear();
+        return;
+    }
+    compensated_pts.resize(input_pts.size());
+
+    // Intrinsic matrix(相机内参).
+    cv::Matx33f K(
+        intrinsics[0], 0.0, intrinsics[2],
+        0.0, intrinsics[1], intrinsics[3],
+        0.0, 0.0, 1.0);
+    //将上一帧中的特这点坐标通过相机内参和相机旋转矩阵映射到当前帧中（像素坐标）
+    cv::Matx33f H = K * R_p_c * K.inv();  
+
+    for (int i = 0; i < input_pts.size(); ++i) {
+        //补成齐次坐标
+        cv::Vec3f p1(input_pts[i].x, input_pts[i].y, 1.0f);
+        cv::Vec3f p2 = H * p1;
+        compensated_pts[i].x = p2[0] / p2[2];
+        compensated_pts[i].y = p2[1] / p2[2];
+    }
+
+    return;
+}
+
+void TrackLARVIO::createImagePyramids() {
+    const cv::Mat& curr_img = curr_img_ptr->image;
+    // CLAHE
+    cv::Mat img_;
+    img_ = curr_img;
+
+    // Get Pyramid
+    cv::buildOpticalFlowPyramid(img_, curr_pyramid_, win_size, pyr_levels);   
+}
+
+void TrackLARVIO::undistortPoints(
+    const std::vector<cv::Point2f>& pts_in,
+    const cv::Vec4d& intrinsics,
+    const cv::Vec4d& distortion_coeffs,
+    std::vector<cv::Point2f>& pts_out,
+    const cv::Matx33d &rectification_matrix,
+    const cv::Vec4d &new_intrinsics) {
+    if (pts_in.size() == 0) return;
+
+    const cv::Matx33d K(
+            intrinsics[0], 0.0, intrinsics[2],
+            0.0, intrinsics[1], intrinsics[3],
+            0.0, 0.0, 1.0);
+
+    const cv::Matx33d K_new(
+            new_intrinsics[0], 0.0, new_intrinsics[2],
+            0.0, new_intrinsics[1], new_intrinsics[3],
+            0.0, 0.0, 1.0);
+    
+    if (this->camera_fisheye.at(0)) {
+        cv::fisheye::undistortPoints(pts_in, pts_out, K, distortion_coeffs,rectification_matrix, K_new);\
+        return;       
+        }
+    cv::undistortPoints(pts_in, pts_out, K, distortion_coeffs,rectification_matrix, K_new);
+    return;    
+        
+}
 
 //imu积分
-void TrackLARVIO::integrateImuData(Matx33f& cam_R_p2c,
-        const std::vector<ImuData>& imu_msg_buffer) {
+void TrackLARVIO::integrateImuData(cv::Matx33f& cam_R_p2c,const std::vector<ImuData>& imu_msg_buffer) {
     // Find the start and the end limit within the imu msg buffer.
     auto begin_iter = imu_msg_buffer.begin();
     //begin在上一帧前0.0049s以内
@@ -29,9 +793,9 @@ void TrackLARVIO::integrateImuData(Matx33f& cam_R_p2c,
     }
     //计算角速度均值
     // Compute the mean angular velocity in the IMU frame.
-    Vec3f mean_ang_vel(0.0, 0.0, 0.0);
+    cv::Vec3f mean_ang_vel(0.0, 0.0, 0.0);
     for (auto iter = begin_iter; iter < end_iter; ++iter)
-    mean_ang_vel += Vec3f(iter->angular_velocity[0],
+    mean_ang_vel += cv::Vec3f(iter->angular_velocity[0],
         iter->angular_velocity[1], iter->angular_velocity[2]);
 
     if (end_iter-begin_iter > 0)
@@ -40,22 +804,37 @@ void TrackLARVIO::integrateImuData(Matx33f& cam_R_p2c,
     // Transform the mean angular velocity from the IMU
     // frame to the cam0 and cam1 frames.
     //imu坐标系转换到相机坐标系
-    Vec3f cam_mean_ang_vel = R_cam_imu.t() * mean_ang_vel;
+    cv::Vec3f cam_mean_ang_vel = R_cam_imu.t() * mean_ang_vel;
 
     // Compute the relative rotation.
     double dtime = curr_img_ptr->timeStampToSec-
         prev_img_ptr->timeStampToSec;
-    Rodrigues(cam_mean_ang_vel*dtime, cam_R_p2c);
+    cv::Rodrigues(cam_mean_ang_vel*dtime, cam_R_p2c);
     cam_R_p2c = cam_R_p2c.t();
     //cam_R_p2c是输出的imu计算的相机旋转矩阵
     return;
 }
 
-
-void TrackKLT::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) {
+//原始
+void TrackLARVIO::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) {
 
     // Start timing
     rT1 =  boost::posix_time::microsec_clock::local_time();
+
+    if (!bFirstImg) {
+        if ((imu_msg_buffer.begin() != imu_msg_buffer.end()) && 
+            (imu_msg_buffer.begin()->timeStampToSec-timestamp <= 0.0)) {
+            bFirstImg = true;
+            printf("Images from now on will be utilized...\n\n");
+        }
+        else
+            return ;
+    }
+
+    curr_img_ptr->timeStampToSec=timestamp;
+    curr_img_ptr->image=img;
+    curr_img_time=curr_img_ptr->timeStampToSec;
+    
 
     // Lock this data feed for this camera
     std::unique_lock<std::mutex> lck(mtx_feeds.at(cam_id));
@@ -65,69 +844,76 @@ void TrackKLT::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) {
     cv::equalizeHist(img, img);
 
     // Extract the new image pyramid
-    std::vector<cv::Mat> imgpyr;
-    cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
+    createImagePyramids();
+    currORBDescriptor_ptr.reset(new ORBdescriptor(curr_pyramid_[0], 2, pyr_levels));
+    std::vector<cv::Mat> imgpyr(curr_pyramid_);
+    bool haveFeatures = false;
+    
+    //cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
     rT2 =  boost::posix_time::microsec_clock::local_time();
 
-    // If we didn't have any successful tracks last time, just extract this time
-    // This also handles, the tracking initalization on the first call to this extractor
-    if(pts_last[cam_id].empty()) {
-        // Detect new features
-        perform_detection_monocular(imgpyr, pts_last[cam_id], ids_last[cam_id]);
-        // Save the current image and pyramid
-        img_last[cam_id] = img.clone();
-        img_pyramid_last[cam_id] = imgpyr;
-        return;
+    if ( FIRST_IMAGE==image_state ) {
+        if (initializeFirstFrame())
+            image_state = SECOND_IMAGE;
+    } else if ( SECOND_IMAGE==image_state ) {
+        if ( !initializeFirstFeatures(imu_msg_buffer) ) {
+            image_state = FIRST_IMAGE;
+        } else {
+            // frequency control
+            if ( curr_img_time-last_pub_time >= 0.9*(1.0/10) ) {
+                // Find new features to be tracked
+                findNewFeaturesToBeTracked();
+
+                // Det processed feature
+
+                // Publishing msgs
+
+                haveFeatures = true;
+            }
+
+            image_state = OTHER_IMAGES;
+        }
+    } else if ( OTHER_IMAGES==image_state ) {
+        // Integrate gyro data to get a guess of rotation between current and previous image
+        integrateImuData(R_Prev2Curr, imu_msg_buffer);
+
+        // Tracking features
+        trackFeatures();
+
+        // Track new features extracted in last image, and add them into the gird
+        trackNewFeatures();
+
+        // frequency control
+        if ( curr_img_time-last_pub_time >= 0.9*(1.0/10) ) {
+            // Find new features to be tracked
+            findNewFeaturesToBeTracked();
+
+            // Det processed feature
+
+            haveFeatures = true;
+        }
     }
 
-    // First we should make that the last images have enough features so we can do KLT
-    // This will "top-off" our number of tracks so always have a constant number
-    perform_detection_monocular(img_pyramid_last[cam_id], pts_last[cam_id], ids_last[cam_id]);
     rT3 =  boost::posix_time::microsec_clock::local_time();
 
-    //===================================================================================
-    //===================================================================================
-
-    // Debug
-    //printf("current points = %d,%d\n",(int)pts_left_last.size(),(int)pts_right_last.size());
-
-    // Our return success masks, and predicted new features
-    std::vector<uchar> mask_ll;
-    std::vector<cv::KeyPoint> pts_left_new = pts_last[cam_id];
-
-    // Lets track temporally
-    perform_matching(img_pyramid_last[cam_id],imgpyr,pts_last[cam_id],pts_left_new,cam_id,cam_id,mask_ll);
     rT4 =  boost::posix_time::microsec_clock::local_time();
 
     //===================================================================================
     //===================================================================================
 
     // If any of our mask is empty, that means we didn't have enough to do ransac, so just return
-    if(mask_ll.empty()) {
-        img_last[cam_id] = img.clone();
-        img_pyramid_last[cam_id] = imgpyr;
-        pts_last[cam_id].clear();
-        ids_last[cam_id].clear();
-        printf(RED "[KLT-EXTRACTOR]: Failed to get enough points to do RANSAC, resetting.....\n" RESET);
-        return;
-    }
 
     // Get our "good tracks"
-    std::vector<cv::KeyPoint> good_left;
+
+    std::vector<cv::Point2f> good_left;
     std::vector<size_t> good_ids_left;
 
     // Loop through all left points
-    for(size_t i=0; i<pts_left_new.size(); i++) {
-        // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-        if(pts_left_new[i].pt.x < 0 || pts_left_new[i].pt.y < 0)
-            continue;
-        // If it is a good track, and also tracked from left to right
-        if(mask_ll[i]) {
-            good_left.push_back(pts_left_new[i]);
-            good_ids_left.push_back(ids_last[cam_id][i]);
-        }
-    }
 
+for(size_t i=0; i<prev_pts_.size(); i++) {
+    good_left.push_back(prev_pts_[i]);
+    good_ids_left.push_back(pts_ids_[i]);
+}
 
     //===================================================================================
     //===================================================================================
@@ -135,493 +921,81 @@ void TrackKLT::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) {
 
     // Update our feature database, with theses new observations
     for(size_t i=0; i<good_left.size(); i++) {
-        cv::Point2f npt_l = undistort_point(good_left.at(i).pt, cam_id);
+        cv::Point2f npt_l = undistort_point(good_left.at(i), cam_id);
         database->update_feature(good_ids_left.at(i), timestamp, cam_id,
-                                 good_left.at(i).pt.x, good_left.at(i).pt.y,
+                                 good_left.at(i).x, good_left.at(i).y,
                                  npt_l.x, npt_l.y);
     }
+
+    // Update the previous image and previous features.
+    prev_img_ptr = curr_img_ptr;
+    std::swap(prev_pyramid_,curr_pyramid_);
+    prevORBDescriptor_ptr = currORBDescriptor_ptr;
+
+    // Initialize the current features to empty vectors.
+    std::swap(prev_pts_,curr_pts_);
+    std::vector<cv::Point2f>().swap(curr_pts_);
+
+    prev_img_time = curr_img_time;
 
     // Move forward in time
     img_last[cam_id] = img.clone();
     img_pyramid_last[cam_id] = imgpyr;
-    pts_last[cam_id] = good_left;
     ids_last[cam_id] = good_ids_left;
+
+    std::vector<cv::Point2f>().swap(good_left);
+    std::vector<size_t>().swap(good_ids_left);
+
     rT5 =  boost::posix_time::microsec_clock::local_time();
 
-    // Timing information
-    //printf("[TIME-KLT]: %.4f seconds for pyramid\n",(rT2-rT1).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for detection\n",(rT3-rT2).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for temporal klt\n",(rT4-rT3).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n",(rT5-rT4).total_microseconds() * 1e-6, (int)good_left.size());
-    //printf("[TIME-KLT]: %.4f seconds for total\n",(rT5-rT1).total_microseconds() * 1e-6);
-
-
 }
 
+void TrackLARVIO::setcameraintrinsics(std::map<size_t,Eigen::VectorXd> camera_calib, const Eigen::Matrix<double, 4, 1> camex) {
 
-void TrackKLT::feed_stereo(double timestamp, cv::Mat &img_leftin, cv::Mat &img_rightin, size_t cam_id_left, size_t cam_id_right) {
+    cam_intrinsics(0)=camera_calib.at(0)[0];
+    cam_intrinsics(1)=camera_calib.at(0)[1];
+    cam_intrinsics(2)=camera_calib.at(0)[2];
+    cam_intrinsics(3)=camera_calib.at(0)[3];
+    
+    Eigen::Matrix<double, 3, 1> temp=camex.block(0,0,3,1);
+    Eigen::Matrix<double, 3, 3> q_x;
+            q_x << 0, -temp(2), temp(1),
+                temp(2), 0, -temp(0),
+                -temp(1), temp(0), 0;
 
-    // Start timing
-    rT1 =  boost::posix_time::microsec_clock::local_time();
+    Eigen::MatrixXd temp1 = (2 * std::pow(camex(3, 0), 2) - 1) * Eigen::MatrixXd::Identity(3, 3)
+                              - 2 * camex(3, 0) * q_x +
+                              2 * camex.block(0, 0, 3, 1) * (camex.block(0, 0, 3, 1).transpose());
+    for(int i=0;i<3;i++){
+        for(int j=0;j<3;j++){
 
-    // Lock this data feed for this camera
-    std::unique_lock<std::mutex> lck1(mtx_feeds.at(cam_id_left));
-    std::unique_lock<std::mutex> lck2(mtx_feeds.at(cam_id_right));
+            R_cam_imu(i,j)=temp1(i,j);
 
-    // Histogram equalize
-    cv::Mat img_left, img_right;
-    boost::thread t_lhe = boost::thread(cv::equalizeHist, boost::cref(img_leftin), boost::ref(img_left));
-    boost::thread t_rhe = boost::thread(cv::equalizeHist, boost::cref(img_rightin), boost::ref(img_right));
-    t_lhe.join();
-    t_rhe.join();
-
-    // Extract image pyramids (boost seems to require us to put all the arguments even if there are defaults....)
-    std::vector<cv::Mat> imgpyr_left, imgpyr_right;
-    boost::thread t_lp = boost::thread(cv::buildOpticalFlowPyramid, boost::cref(img_left),
-                                       boost::ref(imgpyr_left), boost::ref(win_size), boost::ref(pyr_levels), false,
-                                       cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, true);
-    boost::thread t_rp = boost::thread(cv::buildOpticalFlowPyramid, boost::cref(img_right),
-                                       boost::ref(imgpyr_right), boost::ref(win_size), boost::ref(pyr_levels),
-                                       false, cv::BORDER_REFLECT_101, cv::BORDER_CONSTANT, true);
-    t_lp.join();
-    t_rp.join();
-    rT2 =  boost::posix_time::microsec_clock::local_time();
-
-    // If we didn't have any successful tracks last time, just extract this time
-    // This also handles, the tracking initalization on the first call to this extractor
-    if(pts_last[cam_id_left].empty() || pts_last[cam_id_right].empty()) {
-        // Track into the new image
-        perform_detection_stereo(imgpyr_left, imgpyr_right, pts_last[cam_id_left], pts_last[cam_id_right], ids_last[cam_id_left], ids_last[cam_id_right]);
-        // Save the current image and pyramid
-        img_last[cam_id_left] = img_left.clone();
-        img_last[cam_id_right] = img_right.clone();
-        img_pyramid_last[cam_id_left] = imgpyr_left;
-        img_pyramid_last[cam_id_right] = imgpyr_right;
-        return;
-    }
-
-    // First we should make that the last images have enough features so we can do KLT
-    // This will "top-off" our number of tracks so always have a constant number
-    perform_detection_stereo(img_pyramid_last[cam_id_left], img_pyramid_last[cam_id_right],
-                             pts_last[cam_id_left], pts_last[cam_id_right],
-                             ids_last[cam_id_left], ids_last[cam_id_right]);
-    rT3 =  boost::posix_time::microsec_clock::local_time();
-
-
-    //===================================================================================
-    //===================================================================================
-
-    // Our return success masks, and predicted new features
-    std::vector<uchar> mask_ll, mask_rr;
-    std::vector<cv::KeyPoint> pts_left_new = pts_last[cam_id_left];
-    std::vector<cv::KeyPoint> pts_right_new = pts_last[cam_id_right];
-
-    // Lets track temporally
-    boost::thread t_ll = boost::thread(&TrackKLT::perform_matching, this, boost::cref(img_pyramid_last[cam_id_left]), boost::cref(imgpyr_left),
-                                       boost::ref(pts_last[cam_id_left]), boost::ref(pts_left_new), cam_id_left, cam_id_left, boost::ref(mask_ll));
-    boost::thread t_rr = boost::thread(&TrackKLT::perform_matching, this, boost::cref(img_pyramid_last[cam_id_right]), boost::cref(imgpyr_right),
-                                       boost::ref(pts_last[cam_id_right]), boost::ref(pts_right_new), cam_id_right, cam_id_right, boost::ref(mask_rr));
-
-    // Wait till both threads finish
-    t_ll.join();
-    t_rr.join();
-    rT4 =  boost::posix_time::microsec_clock::local_time();
-
-
-    //===================================================================================
-    //===================================================================================
-
-
-    // left to right matching
-    // TODO: we should probably still do this to reject outliers
-    // TODO: maybe we should collect all tracks that are in both frames and make they pass this?
-    //std::vector<uchar> mask_lr;
-    //perform_matching(imgpyr_left, imgpyr_right, pts_left_new, pts_right_new, cam_id_left, cam_id_right, mask_lr);
-    rT5 =  boost::posix_time::microsec_clock::local_time();
-
-
-    //===================================================================================
-    //===================================================================================
-
-    // If any of our masks are empty, that means we didn't have enough to do ransac, so just return
-    if(mask_ll.empty() || mask_rr.empty()) {
-        img_last[cam_id_left] = img_left.clone();
-        img_last[cam_id_right] = img_right.clone();
-        img_pyramid_last[cam_id_left] = imgpyr_left;
-        img_pyramid_last[cam_id_right] = imgpyr_right;
-        pts_last[cam_id_left].clear();
-        pts_last[cam_id_right].clear();
-        ids_last[cam_id_left].clear();
-        ids_last[cam_id_right].clear();
-        printf(RED "[KLT-EXTRACTOR]: Failed to get enough points to do RANSAC, resetting....." RESET);
-        return;
-    }
-
-    // Get our "good tracks"
-    std::vector<cv::KeyPoint> good_left, good_right;
-    std::vector<size_t> good_ids_left, good_ids_right;
-
-    // Loop through all left points
-    for(size_t i=0; i<pts_left_new.size(); i++) {
-        // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-        if(pts_left_new[i].pt.x < 0 || pts_left_new[i].pt.y < 0 || (int)pts_right_new[i].pt.x > img_left.cols || (int)pts_right_new[i].pt.y > img_left.rows)
-            continue;
-        // See if we have the same feature in the right
-        bool found_right = false;
-        size_t index_right = 0;
-        for(size_t n=0; n<ids_last[cam_id_right].size(); n++) {
-            if(ids_last[cam_id_left].at(i)==ids_last[cam_id_right].at(n)) {
-                found_right = true;
-                index_right = n;
-                break;
-            }
         }
-        // If it is a good track, and also tracked from left to right
-        // Else track it as a mono feature in just the left image
-        if(mask_ll[i] && found_right && mask_rr[index_right]) {
-            // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-            if(pts_right_new.at(index_right).pt.x < 0 || pts_right_new.at(index_right).pt.y < 0 || (int)pts_right_new[i].pt.x > img_right.cols || (int)pts_right_new[i].pt.y > img_right.rows)
-                continue;
-            good_left.push_back(pts_left_new.at(i));
-            good_right.push_back(pts_right_new.at(index_right));
-            good_ids_left.push_back(ids_last[cam_id_left].at(i));
-            good_ids_right.push_back(ids_last[cam_id_right].at(index_right));
-            //std::cout << "adding to stereo - " << ids_last[cam_id_left].at(i) << " , " << ids_last[cam_id_right].at(index_right) << std::endl;
-        } else if(mask_ll[i]) {
-            good_left.push_back(pts_left_new.at(i));
-            good_ids_left.push_back(ids_last[cam_id_left].at(i));
-            //std::cout << "adding to left - " << ids_last[cam_id_left].at(i) << std::endl;
-        }
-    }
-
-    // Loop through all right points
-    for(size_t i=0; i<pts_right_new.size(); i++) {
-        // Ensure we do not have any bad KLT tracks (i.e., points are negative)
-        if(pts_right_new[i].pt.x < 0 || pts_right_new[i].pt.y < 0 || (int)pts_right_new[i].pt.x > img_right.cols || (int)pts_right_new[i].pt.y > img_right.rows)
-            continue;
-        // See if we have the same feature in the right
-        bool added_already = (std::find(good_ids_right.begin(),good_ids_right.end(),ids_last[cam_id_right].at(i))!=good_ids_right.end());
-        // If it has not already been added as a good feature, add it as a mono track
-        if(mask_rr[i] && !added_already) {
-            good_right.push_back(pts_right_new.at(i));
-            good_ids_right.push_back(ids_last[cam_id_right].at(i));
-            //std::cout << "adding to right - " << ids_last[cam_id_right].at(i) << std::endl;
-        }
-    }
-
-    //===================================================================================
-    //===================================================================================
-
-    // Update our feature database, with theses new observations
-    for(size_t i=0; i<good_left.size(); i++) {
-        cv::Point2f npt_l = undistort_point(good_left.at(i).pt, cam_id_left);
-        database->update_feature(good_ids_left.at(i), timestamp, cam_id_left,
-                                 good_left.at(i).pt.x, good_left.at(i).pt.y,
-                                 npt_l.x, npt_l.y);
-    }
-    for(size_t i=0; i<good_right.size(); i++) {
-        cv::Point2f npt_r = undistort_point(good_right.at(i).pt, cam_id_right);
-        database->update_feature(good_ids_right.at(i), timestamp, cam_id_right,
-                                 good_right.at(i).pt.x, good_right.at(i).pt.y,
-                                 npt_r.x, npt_r.y);
-    }
-
-    // Move forward in time
-    img_last[cam_id_left] = img_left.clone();
-    img_last[cam_id_right] = img_right.clone();
-    img_pyramid_last[cam_id_left] = imgpyr_left;
-    img_pyramid_last[cam_id_right] = imgpyr_right;
-    pts_last[cam_id_left] = good_left;
-    pts_last[cam_id_right] = good_right;
-    ids_last[cam_id_left] = good_ids_left;
-    ids_last[cam_id_right] = good_ids_right;
-    rT6 =  boost::posix_time::microsec_clock::local_time();
-
-    // Timing information
-    //printf("[TIME-KLT]: %.4f seconds for pyramid\n",(rT2-rT1).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for detection\n",(rT3-rT2).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for temporal klt\n",(rT4-rT3).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for stereo klt\n",(rT5-rT4).total_microseconds() * 1e-6);
-    //printf("[TIME-KLT]: %.4f seconds for feature DB update (%d features)\n",(rT6-rT5).total_microseconds() * 1e-6, (int)good_left.size());
-    //printf("[TIME-KLT]: %.4f seconds for total\n",(rT6-rT1).total_microseconds() * 1e-6);
-
-}
-
-void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, std::vector<cv::KeyPoint> &pts0, std::vector<size_t> &ids0) {
-
-    // Create a 2D occupancy grid for this current image
-    // Note that we scale this down, so that each grid point is equal to a set of pixels
-    // This means that we will reject points that less then grid_px_size points away then existing features
-    // TODO: figure out why I need to add the windowsize of the klt to handle features that are outside the image bound
-    // TODO: I assume this is because klt of features at the corners is not really well defined, thus if it doesn't get a match it will be out-of-bounds
-    Eigen::MatrixXi grid_2d = Eigen::MatrixXi::Zero((int)(img0pyr.at(0).rows/min_px_dist)+15, (int)(img0pyr.at(0).cols/min_px_dist)+15);
-    auto it0 = pts0.begin();
-    auto it2 = ids0.begin();
-    while(it0 != pts0.end()) {
-        // Get current left keypoint
-        cv::KeyPoint kpt = *it0;
-        // Check if this keypoint is near another point
-        if(grid_2d((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1) {
-            it0 = pts0.erase(it0);
-            it2 = ids0.erase(it2);
-            continue;
-        }
-        // Else we are good, move forward to the next point
-        grid_2d((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
-        it0++;
-        it2++;
-    }
-
-    // First compute how many more features we need to extract from this image
-    int num_featsneeded = num_features - (int)pts0.size();
-
-    // If we don't need any features, just return
-    if(num_featsneeded < 1)
-        return;
-
-    // Extract our features (use fast with griding)
-    std::vector<cv::KeyPoint> pts0_ext;
-    Grider_FAST::perform_griding(img0pyr.at(0), pts0_ext, num_featsneeded, grid_x, grid_y, threshold, true);
-
-    // Now, reject features that are close a current feature
-    std::vector<cv::KeyPoint> kpts0_new;
-    std::vector<cv::Point2f> pts0_new;
-    for(auto& kpt : pts0_ext) {
-        // See if there is a point at this location
-        if(grid_2d((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1)
-            continue;
-        // Else lets add it!
-        kpts0_new.push_back(kpt);
-        pts0_new.push_back(kpt.pt);
-        grid_2d((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
-    }
-
-    // Loop through and record only ones that are valid
-    for(size_t i=0; i<pts0_new.size(); i++) {
-        // update the uv coordinates
-        kpts0_new.at(i).pt = pts0_new.at(i);
-        // append the new uv coordinate
-        pts0.push_back(kpts0_new.at(i));
-        // move id foward and append this new point
-        size_t temp = ++currid;
-        ids0.push_back(temp);
     }
 
 }
 
+void TrackLARVIO::feedimu(double timestamp, Eigen::Vector3d wm, Eigen::Vector3d am){
 
-void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr,
-                                        std::vector<cv::KeyPoint> &pts0, std::vector<cv::KeyPoint> &pts1,
-                                        std::vector<size_t> &ids0, std::vector<size_t> &ids1) {
-
-    // Create a 2D occupancy grid for this current image
-    // Note that we scale this down, so that each grid point is equal to a set of pixels
-    // This means that we will reject points that less then grid_px_size points away then existing features
-    // TODO: figure out why I need to add the windowsize of the klt to handle features that are outside the image bound
-    // TODO: I assume this is because klt of features at the corners is not really well defined, thus if it doesn't get a match it will be out-of-bounds
-    Eigen::MatrixXi grid_2d_0 = Eigen::MatrixXi::Zero((int)(img0pyr.at(0).rows/min_px_dist)+15, (int)(img0pyr.at(0).cols/min_px_dist)+15);
-    Eigen::MatrixXi grid_2d_1 = Eigen::MatrixXi::Zero((int)(img1pyr.at(0).rows/min_px_dist)+15, (int)(img1pyr.at(0).cols/min_px_dist)+15);
-    auto it0 = pts0.begin();
-    auto it1 = ids0.begin();
-    while(it0 != pts0.end()) {
-        // Get current left keypoint
-        cv::KeyPoint kpt = *it0;
-        // Check if this keypoint is near another point
-        if(grid_2d_0((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1) {
-            it0 = pts0.erase(it0);
-            it1 = ids0.erase(it1);
-            continue;
-        }
-        // Else we are good, move forward to the next point
-        grid_2d_0((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
-        it0++;
-        it1++;
-    }
-    it0 = pts1.begin();
-    it1 = ids1.begin();
-    while(it0 != pts1.end()) {
-        // Get current right keypoint
-        cv::KeyPoint kpt = *it0;
-        // Check if this keypoint is near another point
-        if(grid_2d_1((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1) {
-            it0 = pts1.erase(it0);
-            it1 = ids1.erase(it1);
-            continue;
-        }
-        // Else we are good, move forward to the next point
-        grid_2d_1((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
-        it0++;
-        it1++;
-    }
-
-    // First compute how many more features we need to extract from this image
-    int num_featsneeded_0 = num_features - (int)pts0.size();
-
-    // LEFT: if we need features we should extract them in the current frame
-    // LEFT: we will also try to track them from this frame over to the right frame
-    // LEFT: in the case that we have two features that are the same, then we should merge them
-    if(num_featsneeded_0 > 1) {
-
-        // Extract our features (use fast with griding)
-        std::vector<cv::KeyPoint> pts0_ext;
-        Grider_FAST::perform_griding(img0pyr.at(0), pts0_ext, num_featsneeded_0, grid_x, grid_y, threshold, true);
-
-        // Now, reject features that are close a current feature
-        std::vector<cv::KeyPoint> kpts0_new;
-        std::vector<cv::Point2f> pts0_new;
-        for(auto& kpt : pts0_ext) {
-            // See if there is a point at this location
-            if(grid_2d_0((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1)
-                continue;
-            // Else lets add it!
-            kpts0_new.push_back(kpt);
-            pts0_new.push_back(kpt.pt);
-            grid_2d_0((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
-        }
-
-        // TODO: Project points from the left frame into the right frame
-        // TODO: This will not work for large baseline systems.....
-        std::vector<cv::KeyPoint> kpts1_new;
-        std::vector<cv::Point2f> pts1_new;
-        kpts1_new = kpts0_new;
-        pts1_new = pts0_new;
-
-        // If we have points, do KLT tracking to get the valid projections
-        if(!pts0_new.empty()) {
-
-            // Do our KLT tracking from the left to the right frame of reference
-            // Note: we have a pretty big window size here since our projection might be bad
-            // Note: but this might cause failure in cases of repeated textures (eg. checkerboard)
-            std::vector<uchar> mask;
-            std::vector<float> error;
-            cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01);
-            cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0_new, pts1_new, mask, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
-
-            // Loop through and record only ones that are valid
-            for(size_t i=0; i<pts0_new.size(); i++) {
-
-                // Check that our tracks are in bounds
-                bool outof_bounds_0 = (pts0_new.at(i).x < 0 || pts0_new.at(i).y < 0 || pts0_new.at(i).x >= img0pyr.at(0).cols || pts0_new.at(i).y >= img0pyr.at(0).rows);
-                bool outof_bounds_1 = (pts1_new.at(i).x < 0 || pts1_new.at(i).y < 0 || pts1_new.at(i).x >= img1pyr.at(0).cols || pts1_new.at(i).y >= img1pyr.at(0).rows);
-
-                // If this is not already in the right image, then we should treat it as a stereo
-                // Otherwise we will treat this as just a monocular track of the feature
-                // TODO: we should check to see if we can combine this new feature and the one in the right
-                if(!outof_bounds_0 && mask[i] == 1 && !outof_bounds_1 && !(grid_2d_1((int)(pts1_new.at(i).y/min_px_dist),(int)(pts1_new.at(i).x/min_px_dist)) == 1)) {
-                    // update the uv coordinates
-                    kpts0_new.at(i).pt = pts0_new.at(i);
-                    kpts1_new.at(i).pt = pts1_new.at(i);
-                    // append the new uv coordinate
-                    pts0.push_back(kpts0_new.at(i));
-                    pts1.push_back(kpts1_new.at(i));
-                    // move id forward and append this new point
-                    size_t temp = ++currid;
-                    ids0.push_back(temp);
-                    ids1.push_back(temp);
-                } else if(!outof_bounds_0) {
-                    // update the uv coordinates
-                    kpts0_new.at(i).pt = pts0_new.at(i);
-                    // append the new uv coordinate
-                    pts0.push_back(kpts0_new.at(i));
-                    // move id forward and append this new point
-                    size_t temp = ++currid;
-                    ids0.push_back(temp);
-                }
-            }
-
-        }
-    }
-
-    // RIGHT: if we need features we should extract them in the current frame
-    // RIGHT: note that we don't track them to the left as we already did left->right tracking above
-    int num_featsneeded_1 = num_features - (int)pts1.size();
-    if(num_featsneeded_1 > 1) {
-
-        // Extract our features (use fast with griding)
-        std::vector<cv::KeyPoint> pts1_ext;
-        Grider_FAST::perform_griding(img1pyr.at(0), pts1_ext, num_featsneeded_1, grid_x, grid_y, threshold, true);
-
-        // Now, reject features that are close a current feature
-        for(auto& kpt : pts1_ext) {
-            // See if there is a point at this location
-            if(grid_2d_1((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) == 1)
-                continue;
-            // Else lets add it!
-            pts1.push_back(kpt);
-            size_t temp = ++currid;
-            ids1.push_back(temp);
-            grid_2d_1((int)(kpt.pt.y/min_px_dist),(int)(kpt.pt.x/min_px_dist)) = 1;
-        }
-
-
-    }
-
+    imu_msg_buffer.push_back(ImuData(timestamp, wm[0], wm[1], wm[2], am[0], am[1], am[2]));
 
 }
 
-
-void TrackKLT::perform_matching(const std::vector<cv::Mat>& img0pyr, const std::vector<cv::Mat>& img1pyr,
-                                std::vector<cv::KeyPoint>& kpts0, std::vector<cv::KeyPoint>& kpts1,
-                                size_t id0, size_t id1,
-                                std::vector<uchar>& mask_out) {
-
-    // We must have equal vectors
-    assert(kpts0.size() == kpts1.size());
-
-    // Return if we don't have any points
-    if(kpts0.empty() || kpts1.empty())
-        return;
-
-    // Convert keypoints into points (stupid opencv stuff)
-    std::vector<cv::Point2f> pts0, pts1;
-    for(size_t i=0; i<kpts0.size(); i++) {
-        pts0.push_back(kpts0.at(i).pt);
-        pts1.push_back(kpts1.at(i).pt);
-    }
-
-    // If we don't have enough points for ransac just return empty
-    // We set the mask to be all zeros since all points failed RANSAC
-    if(pts0.size() < 10) {
-        for(size_t i=0; i<pts0.size(); i++)
-            mask_out.push_back((uchar)0);
-        return;
-    }
-
-    // Now do KLT tracking to get the valid new points
-    std::vector<uchar> mask_klt;
-    std::vector<float> error;
-    cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 15, 0.01);
-    //上一帧图像金字塔、当前帧金字塔、上一帧特征点vector、当前帧vector、局内点vector、光流size
-    //输出mask局内点vector
-    cv::calcOpticalFlowPyrLK(img0pyr, img1pyr, pts0, pts1, mask_klt, error, win_size, pyr_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
-
-
-    // Normalize these points, so we can then do ransac
-    // We don't want to do ransac on distorted image uvs since the mapping is nonlinear
-    std::vector<cv::Point2f> pts0_n, pts1_n;
-    for(size_t i=0; i<pts0.size(); i++) {
-        pts0_n.push_back(undistort_point(pts0.at(i),id0));
-        pts1_n.push_back(undistort_point(pts1.at(i),id1));
-    }
-
-    // Do RANSAC outlier rejection (note since we normalized the max pixel error is now in the normalized cords)
-    std::vector<uchar> mask_rsc;
-    double max_focallength_img0 = std::max(camera_k_OPENCV.at(id0)(0,0),camera_k_OPENCV.at(id0)(1,1));
-    double max_focallength_img1 = std::max(camera_k_OPENCV.at(id1)(0,0),camera_k_OPENCV.at(id1)(1,1));
-    double max_focallength = std::max(max_focallength_img0,max_focallength_img1);
-    //之前帧、当前帧、输出maskrsc
-    cv::findFundamentalMat(pts0_n, pts1_n, cv::FM_RANSAC, 1/max_focallength, 0.999, mask_rsc);
-
-    // Loop through and record only ones that are valid
-    for(size_t i=0; i<mask_klt.size(); i++) {
-        auto mask = (uchar)((i < mask_klt.size() && mask_klt[i] && i < mask_rsc.size() && mask_rsc[i])? 1 : 0);
-        mask_out.push_back(mask);
-    }
-
-    // Copy back the updated positions
-    for(size_t i=0; i<pts0.size(); i++) {
-        kpts0.at(i).pt = pts0.at(i);
-        kpts1.at(i).pt = pts1.at(i);
-    }
+void TrackLARVIO::feed_stereo(double timestamp, cv::Mat &img_left, cv::Mat &img_right, size_t cam_id_left, size_t cam_id_right){
 
 }
+
+void TrackLARVIO::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, std::vector<cv::KeyPoint> &pts0, std::vector<size_t> &ids0){
+
+}
+
+void TrackLARVIO::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &pts0,
+                                      std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1){
+
+                                      }
+
+void TrackLARVIO::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &pts0,
+                              std::vector<cv::KeyPoint> &pts1, size_t id0, size_t id1, std::vector<uchar> &mask_out){
+
+                              }

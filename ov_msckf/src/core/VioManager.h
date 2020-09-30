@@ -25,6 +25,7 @@
 #include <string>
 #include <algorithm>
 #include <fstream>
+#include <Eigen/Eigen>
 #include <Eigen/StdVector>
 #include <boost/filesystem.hpp>
 
@@ -35,6 +36,8 @@
 #include "init/InertialInitializer.h"
 #include "types/LandmarkRepresentation.h"
 #include "types/Landmark.h"
+
+#include "track/TrackLARVIO.h"
 
 #include "state/Propagator.h"
 #include "state/State.h"

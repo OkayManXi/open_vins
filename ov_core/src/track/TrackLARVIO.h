@@ -3,6 +3,9 @@
 
 
 #include "TrackBase.h"
+#include "ORBDescriptor.h"
+#include "ImuData.hpp"
+#include "ImageData.hpp"
 
 
 namespace ov_core {
@@ -49,6 +52,9 @@ namespace ov_core {
          */
         void feed_stereo(double timestamp, cv::Mat &img_left, cv::Mat &img_right, size_t cam_id_left, size_t cam_id_right) override;
 
+        void feedimu(double timestamp, Eigen::Vector3d wm, Eigen::Vector3d am) override;
+
+        void setcameraintrinsics(std::map<size_t,Eigen::VectorXd> camera_calib,const Eigen::Matrix<double, 4, 1> camex) override;
 
     protected:
 
@@ -107,7 +113,7 @@ namespace ov_core {
         int grid_y;
 
         // Minimum pixel distance to be "far away enough" to be a different extracted feature
-        int min_px_dist;
+        int min_px_dist=20;
 
         // How many pyramid levels to track on and the window size to reduce by
         int pyr_levels = 3;
@@ -117,56 +123,102 @@ namespace ov_core {
         std::map<size_t, std::vector<cv::Mat>> img_pyramid_last;
 
     //private:
-
+        //增加的
         //IMU state buffer
+
         std::vector<ImuData> imu_msg_buffer;
 
         // Take a vector from prev cam frame to curr cam frame
         cv::Matx33f R_Prev2Curr;  
         cv::Matx33d R_cam_imu;
 
+        // Pyramids for previous and current image
+        std::vector<cv::Mat> prev_pyramid_;
+        std::vector<cv::Mat> curr_pyramid_;
+        typedef unsigned long int FeatureIDType;
+
+        FeatureIDType next_feature_id=0;
+
         ImageDataPtr prev_img_ptr;
         ImageDataPtr curr_img_ptr;
+
+        int before_tracking;
+        int after_tracking;
+        int after_ransac;
+
+        // Points for tracking, added by QXC
+        std::vector<cv::Point2f> new_pts_;
+        std::vector<cv::Point2f> prev_pts_;
+        std::vector<cv::Point2f> curr_pts_;
+        std::vector<FeatureIDType> pts_ids_;
+        std::vector<int> pts_lifetime_;
+        std::vector<cv::Point2f> init_pts_;
+
+        // Time of last published image
+        double last_pub_time;
+        double curr_img_time;
+        double prev_img_time;
+
+        cv::Vec4d cam_intrinsics;
+
+        template <typename T>
+        void removeUnmarkedElements(
+            const std::vector<T>& raw_vec,
+            const std::vector<unsigned char>& markers,
+            std::vector<T>& refined_vec) {
+            if (raw_vec.size() != markers.size()) {
+                for (int i = 0; i < raw_vec.size(); ++i)
+                refined_vec.push_back(raw_vec[i]);
+            return;
+            }
+            for (int i = 0; i < markers.size(); ++i) {
+                if (markers[i] == 0) continue;
+                refined_vec.push_back(raw_vec[i]);
+            }
+            return;
+        }
+
+        void undistortPoints(const std::vector<cv::Point2f>& pts_in,
+        const cv::Vec4d& intrinsics, const cv::Vec4d& distortion_coeffs,
+        std::vector<cv::Point2f>& pts_out, const cv::Matx33d &rectification_matrix = cv::Matx33d::eye(),
+        const cv::Vec4d &new_intrinsics = cv::Vec4d(1,1,0,0));
 
         //imu计算位姿差
         void integrateImuData(cv::Matx33f& cam_R_p2c, const std::vector<ImuData>& imu_msg_buffer);
 
-    };
+        void predictFeatureTracking(const std::vector<cv::Point2f>& input_pts,const cv::Matx33f& R_p_c,const cv::Vec4d& intrinsics,std::vector<cv::Point2f>& compenstated_pts);
 
-    typedef ImageProcessor::Ptr ImageProcessorPtr;
-    typedef ImageProcessor::ConstPtr ImageProcessorConstPtr;
+        bool initializeFirstFrame();
 
-    struct ImuData {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+        bool initializeFirstFeatures(const std::vector<ImuData>& imu_msg_buffer);
 
-        ImuData (double t, double wx, double wy, double wz, 
-            double ax, double ay, double az) {
-            timeStampToSec = t;
-            angular_velocity[0] = wx;
-            angular_velocity[1] = wy;
-            angular_velocity[2] = wz;
-            linear_acceleration[0] = ax;
-            linear_acceleration[1] = ay;
-            linear_acceleration[2] = az;
-        }
+        void createImagePyramids();
 
-        ImuData (double t, const Eigen::Vector3d& omg, const Eigen::Vector3d& acc) {
-            timeStampToSec = t;
-            angular_velocity = omg;
-            linear_acceleration = acc;
-        }
+        void trackFeatures();
 
-        double timeStampToSec;
-        Eigen::Vector3d angular_velocity;
-        Eigen::Vector3d linear_acceleration;
-    };
+        void trackNewFeatures();
 
-    struct ImgData {
-        double timeStampToSec;
-        cv::Mat image;
+        void findNewFeaturesToBeTracked();
+        
+
+        // Enum type for image state.
+        enum eImageState {
+            FIRST_IMAGE = 1,
+            SECOND_IMAGE = 2,
+            OTHER_IMAGES = 3
         };
+        // Indicate if this is the first or second image message.
+        eImageState image_state=FIRST_IMAGE;
 
-    typedef boost::shared_ptr<ImgData> ImageDataPtr;
+        bool bFirstImg;
+
+        // ORB descriptor pointer, added by QXC
+        boost::shared_ptr<ORBdescriptor> prevORBDescriptor_ptr;
+        boost::shared_ptr<ORBdescriptor> currORBDescriptor_ptr;
+        std::vector<cv::Mat> vOrbDescriptors;
+    };
+
+
 
 
 }

@@ -291,6 +291,10 @@ namespace ov_core {
             return undistort_point_brown(pt_in, camK, camD);
         }
 
+        virtual void feedimu(double timestamp, Eigen::Vector3d wm, Eigen::Vector3d am);
+
+        virtual void setcameraintrinsics(std::map<size_t,Eigen::VectorXd> camera_calib, const Eigen::Matrix<double, 4, 1> camex);
+
     protected:
 
         /**

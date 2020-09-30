@@ -23,6 +23,13 @@
 
 using namespace ov_core;
 
+void TrackBase::feedimu(double timestamp, Eigen::Vector3d wm, Eigen::Vector3d am){
+
+}
+
+void TrackBase::setcameraintrinsics(std::map<size_t,Eigen::VectorXd> camera_calib, const Eigen::Matrix<double, 4, 1> camex){
+
+}
 
 void TrackBase::display_active(cv::Mat &img_out, int r1, int g1, int b1, int r2, int g2, int b2) {
 

@@ -101,7 +101,6 @@ VioManager::VioManager(VioManagerOptions& params_) {
     //===================================================================================
     //===================================================================================
 
-
     // Lets make a feature extractor
     if(params.use_klt) {
         trackFEATS = new TrackKLT(params.num_pts,state->_options.max_aruco_features,params.fast_threshold,params.grid_x,params.grid_y,params.min_px_dist);
@@ -110,6 +109,7 @@ VioManager::VioManager(VioManagerOptions& params_) {
         //larvio exteding
         trackFEATS = new TrackLARVIO(params.num_pts,state->_options.max_aruco_features,params.fast_threshold,params.grid_x,params.grid_y,params.min_px_dist);
         trackFEATS->set_calibration(params.camera_intrinsics, params.camera_fisheye);
+        trackFEATS->setcameraintrinsics(params.camera_intrinsics, params.camera_extrinsics.at(0).block(0,0,4,1));
     } else {
         trackFEATS = new TrackDescriptor(params.num_pts,state->_options.max_aruco_features,params.fast_threshold,params.grid_x,params.grid_y,params.knn_ratio);
         trackFEATS->set_calibration(params.camera_intrinsics, params.camera_fisheye);
@@ -157,9 +157,8 @@ void VioManager::feed_measurement_imu(double timestamp, Eigen::Vector3d wm, Eige
     }
 
     //TrackLARVIO
-    if(params.use_LARVIO != nullptr) {
-        trackFEATS->imu_msg_buffer.push_back(ImuData(timestamp,
-            wm(0), wm(1), wm(2), am(0), am(1), am(3)));
+    if(params.use_LARVIO != false) {
+        trackFEATS->feedimu(timestamp, wm, am);
     }
 
 
