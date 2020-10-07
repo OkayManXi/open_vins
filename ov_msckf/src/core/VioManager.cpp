@@ -193,7 +193,7 @@ void VioManager::feed_measurement_monocular(double timestamp, cv::Mat& img0, siz
             return;
         }
     }
-
+    
     // Feed our trackers
     trackFEATS->feed_monocular(timestamp, img0, cam_id);
 
@@ -687,13 +687,13 @@ void VioManager::do_feature_propagate_update(double timestamp) {
     printf("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n",
             state->_imu->quat()(0),state->_imu->quat()(1),state->_imu->quat()(2),state->_imu->quat()(3),
             state->_imu->pos()(0),state->_imu->pos()(1),state->_imu->pos()(2),distance);
+            
     //四元数数据
-    /*
-    std::ofstream outfile(("/home/zty/workspace/catkin_ws_ov/src/open_vins/v101easy.txt"),std::ios::app);
+    std::ofstream outfile(("/home/zty/myGit/open_vins/src/open_vins/v101easy.txt"),std::ios::app);
     outfile <<std::fixed<< std::setprecision(13) << timestamp <<" "<< state->_imu->pos()(0)<<" "<<state->_imu->pos()(1)<<" "<<state->_imu->pos()(2)\
     <<" "<<state->_imu->quat()(0)<<" "<<-state->_imu->quat()(1)<<" "<<-state->_imu->quat()(2)<<" "<<-state->_imu->quat()(3)<<endl;
     outfile.close();
-    */
+    
 
     printf("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n",
              state->_imu->bias_g()(0),state->_imu->bias_g()(1),state->_imu->bias_g()(2),

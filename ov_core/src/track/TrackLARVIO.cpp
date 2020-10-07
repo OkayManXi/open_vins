@@ -668,11 +668,13 @@ bool TrackLARVIO::initializeFirstFrame() {
     */
 
     // Get current image
-    const cv::Mat& img = img_pyramid_last.at(0)[0];
-
+    //std::cout <<  img_pyramid_last.size()<< std::endl;
+    const cv::Mat& img = curr_pyramid_[0];
     // Detect new features on the frist image.
     std::vector<cv::Point2f>().swap(new_pts_);
+     std::cout << "ssssssssssssssssssss" << std::endl;
     cv::goodFeaturesToTrack(img, new_pts_, num_features, 0.01, min_px_dist);
+     std::cout << "ssssssssssssssssssss" << std::endl;
     /*
     std::vector<cv::KeyPoint> pts0_ext;
     //Grider_FAST::perform_griding(img, pts0_ext, num_features, grid_x, grid_y, threshold, true);
@@ -693,7 +695,7 @@ bool TrackLARVIO::initializeFirstFrame() {
     */
     // Initialize last publish time
     last_pub_time = curr_img_ptr->timeStampToSec;
-
+    
     if (new_pts_.size()>20)
         return true;
     else
@@ -831,10 +833,13 @@ void TrackLARVIO::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) 
             return ;
     }
 
-    curr_img_ptr->timeStampToSec=timestamp;
-    curr_img_ptr->image=img;
+    ImageDataPtr msgPtr(new ImgData);
+    msgPtr->timeStampToSec = timestamp;
+    msgPtr->image = img.clone();
+    curr_img_ptr=msgPtr;
     curr_img_time=curr_img_ptr->timeStampToSec;
-    
+    std::vector<cv::Point2f> good_left;
+    std::vector<size_t> good_ids_left;
 
     // Lock this data feed for this camera
     std::unique_lock<std::mutex> lck(mtx_feeds.at(cam_id));
@@ -851,7 +856,7 @@ void TrackLARVIO::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) 
     
     //cv::buildOpticalFlowPyramid(img, imgpyr, win_size, pyr_levels);
     rT2 =  boost::posix_time::microsec_clock::local_time();
-
+   
     if ( FIRST_IMAGE==image_state ) {
         if (initializeFirstFrame())
             image_state = SECOND_IMAGE;
@@ -890,10 +895,30 @@ void TrackLARVIO::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) 
 
             // Det processed feature
 
+            // Loop through all left points
+
+            for(size_t i=0; i<prev_pts_.size(); i++) {
+                good_left.push_back(prev_pts_[i]);
+                good_ids_left.push_back(pts_ids_[i]);
+            }
+
+            //===================================================================================
+            //===================================================================================
+
+
+            // Update our feature database, with theses new observations
+            for(size_t i=0; i<good_left.size(); i++) {
+                cv::Point2f npt_l = undistort_point(good_left.at(i), cam_id);
+                database->update_feature(good_ids_left.at(i), timestamp, cam_id,
+                                        good_left.at(i).x, good_left.at(i).y,
+                                        npt_l.x, npt_l.y);
+            }
+
+
             haveFeatures = true;
         }
     }
-
+     
     rT3 =  boost::posix_time::microsec_clock::local_time();
 
     rT4 =  boost::posix_time::microsec_clock::local_time();
@@ -904,16 +929,16 @@ void TrackLARVIO::feed_monocular(double timestamp, cv::Mat &img, size_t cam_id) 
     // If any of our mask is empty, that means we didn't have enough to do ransac, so just return
 
     // Get our "good tracks"
-
+    /*
     std::vector<cv::Point2f> good_left;
     std::vector<size_t> good_ids_left;
 
     // Loop through all left points
 
-for(size_t i=0; i<prev_pts_.size(); i++) {
-    good_left.push_back(prev_pts_[i]);
-    good_ids_left.push_back(pts_ids_[i]);
-}
+    for(size_t i=0; i<prev_pts_.size(); i++) {
+        good_left.push_back(prev_pts_[i]);
+        good_ids_left.push_back(pts_ids_[i]);
+    }
 
     //===================================================================================
     //===================================================================================
@@ -926,7 +951,7 @@ for(size_t i=0; i<prev_pts_.size(); i++) {
                                  good_left.at(i).x, good_left.at(i).y,
                                  npt_l.x, npt_l.y);
     }
-
+    */
     // Update the previous image and previous features.
     prev_img_ptr = curr_img_ptr;
     std::swap(prev_pyramid_,curr_pyramid_);
@@ -945,7 +970,7 @@ for(size_t i=0; i<prev_pts_.size(); i++) {
 
     std::vector<cv::Point2f>().swap(good_left);
     std::vector<size_t>().swap(good_ids_left);
-
+    
     rT5 =  boost::posix_time::microsec_clock::local_time();
 
 }

@@ -1,8 +1,8 @@
 <launch>
 
     <!-- mono or stereo and what ros bag to play -->
-    <arg name="max_cameras" default="2" />
-    <arg name="use_stereo"  default="true" />
+    <arg name="max_cameras" default="1" />
+    <arg name="use_stereo"  default="false" />
     <arg name="bag_start"   default="0" /> <!-- v1-2: 0, mh1: 40, mh2: 35, mh3-5: 20 -->
     <arg name="bag"         default="/home/zty/data/EUROC/MH0.bag" />
 
